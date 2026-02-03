@@ -10,24 +10,25 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import base64
 import io
+import database  # Import the new database module
 
 # --- Configuration ---
 MODEL_PATH = r"C:\Users\aadit\Downloads\FP_Artefact2191136-1\FP_Artefact2191136\Bone_Fracture_Detection\models\best_bone_fracture_model.pth"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-CLASS_NAMES = ['Healthy', 'Fracture']
+# Swaapped class names based on alphabetical order assumption (Fracture comes before Healthy)
+# and user report of incorrect labeling.
+CLASS_NAMES = ['Fracture', 'Healthy'] 
 
 app = Flask(__name__)
-# Enable CORS for all routes, specifically allowing the frontend origin
+# Enable CORS for all routes
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- Model Architecture (from Notebook) ---
 class BoneFractureClassifier(nn.Module):
-    def __init__(self, num_classes=2, pretrained=False): # Pretrained=False for inference since we load weights
+    def __init__(self, num_classes=2, pretrained=False):
         super(BoneFractureClassifier, self).__init__()
-        # Load ResNet50 structure
-        self.resnet = models.resnet50(weights=None) # Use weights=None for modern torchvision
+        self.resnet = models.resnet50(weights=None)
         
-        # Recreate the architecture exactly as trained
         num_features = self.resnet.fc.in_features
         self.resnet.fc = nn.Sequential(
             nn.Dropout(0.5),
@@ -40,7 +41,7 @@ class BoneFractureClassifier(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
-# --- Grad-CAM Implementation (from Notebook) ---
+# --- Grad-CAM Implementation ---
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -64,16 +65,13 @@ class GradCAM:
             target_class = output.argmax(dim=1).item()
         
         self.model.zero_grad()
-        # Backward pass for the target class
         output[0, target_class].backward()
         
         gradients = self.gradients[0]
         activations = self.activations[0]
         
-        # Global Average Pooling of gradients to get weights
         weights = gradients.mean(dim=(1, 2))
         
-        # Create CAM
         cam = torch.zeros(activations.shape[1:], dtype=torch.float32, device=activations.device)
         for i, w in enumerate(weights):
             cam += w * activations[i]
@@ -91,7 +89,6 @@ def load_model():
         model = BoneFractureClassifier(num_classes=2, pretrained=False)
         checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
         
-        # Handle different saving methods (state_dict vs full checkpoint)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
@@ -106,21 +103,15 @@ def load_model():
         return None
 
 def apply_gradcam_overlay(original_image_pil, cam):
-    # Convert PIL to CV2 (RGB -> BGR usually, but we keep RGB for logic)
     img_np = np.array(original_image_pil)
     height, width = img_np.shape[:2]
     
-    # Resize CAM to image size
     cam_resized = cv2.resize(cam, (width, height))
     
-    # Create heatmap
     heatmap = np.uint8(255 * cam_resized)
     heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    
-    # Convert heatmap to RGB (from BGR)
     heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
     
-    # Overlay: 0.4 heatmap + 0.6 original
     overlay = heatmap_colored * 0.4 + img_np * 0.6
     overlay = np.uint8(overlay)
     
@@ -138,7 +129,6 @@ def transform_image(image_bytes):
 # --- Initialization ---
 classifier = load_model()
 if classifier:
-    # Target layer for ResNet50 is usually layer4[-1]
     gradcam = GradCAM(classifier, classifier.resnet.layer4[-1])
 else:
     print("WARNING: Classifier could not be initialized.")
@@ -160,40 +150,98 @@ def analyze():
         return jsonify({"error": "No file selected"}), 400
 
     try:
-        # Read and preprocess
         image_bytes = file.read()
         original_image, input_tensor = transform_image(image_bytes)
         
-        # Inference & Grad-CAM
         cam, pred_class_idx, output = gradcam.generate_cam(input_tensor)
         
         probabilities = F.softmax(output, dim=1)
         confidence = probabilities[0, pred_class_idx].item()
         prediction = CLASS_NAMES[pred_class_idx]
         
-        # Generate Overlay Image
         overlay_image = apply_gradcam_overlay(original_image, cam)
         
-        # Encode result image to base64
         buffered = io.BytesIO()
         overlay_image.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        gradcam_image_base64 = f"data:image/jpeg;base64,{img_str}"
         
+        # Helper to safely get probability for a class if it exists in CLASS_NAMES
+        def get_prob(name):
+            try:
+                idx = CLASS_NAMES.index(name)
+                return probabilities[0][idx].item()
+            except ValueError:
+                return 0.0
+
+        prob_fracture = get_prob('Fracture')
+        prob_healthy = get_prob('Healthy')
+
+        # Check for patient info in form data (optional)
+        patient_id = request.form.get('patient_id')
+        if patient_id:
+            try:
+                database.save_analysis(
+                    patient_id=int(patient_id),
+                    image_filename=file.filename,
+                    prediction=prediction,
+                    confidence=confidence,
+                    probabilities_healthy=prob_healthy,
+                    probabilities_fracture=prob_fracture,
+                    gradcam_image_path=gradcam_image_base64 # Storing base64 for now for simplicity, ideally should be file path
+                )
+            except Exception as db_err:
+                print(f"Error saving to DB: {db_err}")
+
         return jsonify({
             "prediction": prediction,
             "confidence": f"{confidence * 100:.2f}%",
             "probabilities": {
-                CLASS_NAMES[0]: f"{probabilities[0][0].item() * 100:.2f}%",
-                CLASS_NAMES[1]: f"{probabilities[0][1].item() * 100:.2f}%"
+                "Healthy": f"{prob_healthy * 100:.2f}%",
+                "Fracture": f"{prob_fracture * 100:.2f}%"
             },
-            "gradcam_image": f"data:image/jpeg;base64,{img_str}"
+            "gradcam_image": gradcam_image_base64
         })
 
     except Exception as e:
         print(f"Error processing image: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/patients', methods=['GET', 'POST'])
+def manage_patients():
+    if request.method == 'POST':
+        data = request.json
+        if not all(k in data for k in ('name', 'gender', 'age')):
+             return jsonify({"error": "Missing required fields"}), 400
+        
+        try:
+            pid = database.create_patient(data['name'], data['gender'], int(data['age']))
+            return jsonify({"id": pid, "message": "Patient created successfully"}), 201
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        try:
+            patients = database.get_all_patients()
+            return jsonify(patients), 200
+        except Exception as e:
+             return jsonify({"error": str(e)}), 500
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    try:
+        history = database.get_analysis_history(limit=50)
+        return jsonify(history), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    try:
+        stats = database.get_analysis_stats()
+        return jsonify(stats), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     print("Starting Flask Server...")
-    # Run on 0.0.0.0 to be accessible, port 5000
     app.run(host='0.0.0.0', port=5000, debug=True)
